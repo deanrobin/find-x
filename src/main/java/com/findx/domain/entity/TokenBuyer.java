@@ -21,7 +21,7 @@ import java.time.LocalDateTime;
         indexes = {
                 @Index(name = "idx_chain_token", columnList = "chain_id,token_address"),
                 @Index(name = "idx_buyer_address", columnList = "buyer_address"),
-                @Index(name = "idx_tx_hash", columnList = "tx_hash", unique = true)
+                @Index(name = "idx_tx_buyer", columnList = "tx_hash,buyer_address", unique = true)
         })
 public class TokenBuyer {
 

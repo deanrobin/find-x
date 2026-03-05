@@ -63,7 +63,7 @@ public class ScanServiceImpl implements ScanService {
 
         // 6. 去重后批量保存（txHash 唯一索引防重）
         List<TokenBuyer> toSave = buyers.stream()
-                .filter(b -> !repository.existsByTxHash(b.getTxHash()))
+                .filter(b -> !repository.existsByTxHashAndBuyerAddress(b.getTxHash(), b.getBuyerAddress()))
                 .collect(Collectors.toList());
 
         if (!toSave.isEmpty()) {

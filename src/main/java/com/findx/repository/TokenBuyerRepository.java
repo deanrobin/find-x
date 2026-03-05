@@ -17,7 +17,7 @@ public interface TokenBuyerRepository extends JpaRepository<TokenBuyer, Long> {
     List<TokenBuyer> findByChainIdAndTokenAddressAndBlockNumberBetweenOrderByBlockNumberAsc(
             String chainId, String tokenAddress, long fromBlock, long toBlock);
 
-    boolean existsByTxHash(String txHash);
+    boolean existsByTxHashAndBuyerAddress(String txHash, String buyerAddress);
 
     @Query("SELECT COUNT(DISTINCT t.buyerAddress) FROM TokenBuyer t " +
            "WHERE t.chainId = :chainId AND t.tokenAddress = :tokenAddress")

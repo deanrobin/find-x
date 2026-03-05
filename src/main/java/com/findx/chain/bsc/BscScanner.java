@@ -67,6 +67,12 @@ public class BscScanner implements ChainScanner {
     /** BSCScan API 每次最多返回 10000 条，分页 offset 最大 10000 */
     private static final int BSCSCAN_PAGE_SIZE = 1000;
 
+    /** 每批请求之间的间隔（ms），避免触发限速 */
+    private static final int BATCH_DELAY_MS = 300;
+
+    /** 429 重试最大次数 */
+    private static final int MAX_RETRY = 5;
+
     @Value("${chain.bsc.rpc-url:https://bsc-dataseed1.binance.org/}")
     private String rpcUrl;
 
@@ -208,13 +214,31 @@ public class BscScanner implements ChainScanner {
 
         for (long start = fromBlock; start <= toBlock; start += MAX_BLOCK_RANGE_WEB3J) {
             long end = Math.min(start + MAX_BLOCK_RANGE_WEB3J - 1, toBlock);
-            try {
-                List<TokenBuyer> batch = fetchBatchViaWeb3j(
-                        tokenAddress, start, end, threshold, decimals, factor);
-                result.addAll(batch);
-                log.debug("[BSC][Web3j] 区块 [{},{}] 找到 {} 条", start, end, batch.size());
-            } catch (Exception e) {
-                log.warn("[BSC][Web3j] 区块 [{},{}] 失败: {}", start, end, e.getMessage());
+            int retry = 0;
+            while (retry <= MAX_RETRY) {
+                try {
+                    List<TokenBuyer> batch = fetchBatchViaWeb3j(
+                            tokenAddress, start, end, threshold, decimals, factor);
+                    result.addAll(batch);
+                    if (!batch.isEmpty()) {
+                        log.debug("[BSC][Web3j] 区块 [{},{}] 找到 {} 条", start, end, batch.size());
+                    }
+                    Thread.sleep(BATCH_DELAY_MS);
+                    break;
+                } catch (Exception e) {
+                    String msg = e.getMessage() != null ? e.getMessage() : "";
+                    if (msg.contains("429") && retry < MAX_RETRY) {
+                        long wait = 1000L * (1 << retry); // 指数退避: 1s, 2s, 4s...
+                        log.warn("[BSC][Web3j] 区块 [{},{}] 限速，{}ms 后重试 ({}/{})",
+                                start, end, wait, retry + 1, MAX_RETRY);
+                        Thread.sleep(wait);
+                        retry++;
+                    } else {
+                        log.warn("[BSC][Web3j] 区块 [{},{}] 失败: {}", start, end,
+                                msg.length() > 80 ? msg.substring(0, 80) : msg);
+                        break;
+                    }
+                }
             }
         }
         log.info("[BSC][Web3j] 共找到 {} 条符合记录", result.size());

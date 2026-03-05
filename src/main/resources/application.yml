@@ -30,9 +30,10 @@ spring:
 # ── 各链 RPC 配置 ──────────────────────────────────────────────────
 chain:
   bsc:
-    rpc-url: ${BSC_RPC_URL:https://bsc-dataseed1.binance.org/}
-    # BSCScan API Key（可选）
-    # 配置后自动切换为 BSCScan 数据源，支持任意历史区块查询
+    # NodeReal 免费归档节点（支持全量历史区块）
+    # 免费申请自己的 Key：https://nodereal.io/api-marketplace/bnb-smart-chain-archive-api
+    rpc-url: ${BSC_RPC_URL:https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3}
+    # BSCScan API Key（可选，配置后切换为 BSCScan 数据源）
     # 申请（免费）：https://bscscan.com/myapikey
     bscscan-api-key: ${BSCSCAN_API_KEY:}
   # 后续扩展示例（取消注释即可接入）：
