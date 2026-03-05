@@ -31,6 +31,10 @@ spring:
 chain:
   bsc:
     rpc-url: ${BSC_RPC_URL:https://bsc-dataseed1.binance.org/}
+    # BSCScan API Key（可选）
+    # 配置后自动切换为 BSCScan 数据源，支持任意历史区块查询
+    # 申请（免费）：https://bscscan.com/myapikey
+    bscscan-api-key: ${BSCSCAN_API_KEY:}
   # 后续扩展示例（取消注释即可接入）：
   # eth:
   #   rpc-url: ${ETH_RPC_URL:https://mainnet.infura.io/v3/YOUR_KEY}

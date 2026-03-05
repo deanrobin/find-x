@@ -35,69 +35,83 @@ import java.util.List;
 
 /**
  * BSC 链扫描器
- * 通过 ERC-20 Transfer 事件识别买入行为：
- *   Transfer(from=DEX合约, to=用户地址, value>=阈值)
+ *
+ * 数据源策略（按优先级）：
+ *   1. BSCScan API    — 当 bscscan.api-key 配置时启用（支持任意历史区块）
+ *   2. Web3j RPC      — 默认，适合近 24-48h 数据（公共节点不支持历史存档）
+ *
+ * 注：查询 2周+ 以上历史数据推荐配置 bscscan.api-key 或私有归档节点。
  */
 @Slf4j
 @Component
 public class BscScanner implements ChainScanner {
 
-    /** ERC-20 Transfer 事件签名 */
+    // ─── ERC-20 Transfer 事件 ──────────────────────────────────────
     private static final Event TRANSFER_EVENT = new Event("Transfer",
             Arrays.asList(
-                    new TypeReference<Address>(true) {},   // from (indexed)
-                    new TypeReference<Address>(true) {},   // to   (indexed)
-                    new TypeReference<Uint256>(false) {}   // value
+                    new TypeReference<Address>(true) {},
+                    new TypeReference<Address>(true) {},
+                    new TypeReference<Uint256>(false) {}
             ));
+    private static final String TRANSFER_TOPIC = EventEncoder.encode(TRANSFER_EVENT);
 
-    private static final String TRANSFER_TOPIC =
-            EventEncoder.encode(TRANSFER_EVENT);
-
-    /** BSC 平均出块时间（秒） */
+    /** BSC 出块时间（秒） */
     private static final int BSC_BLOCK_TIME_SECONDS = 3;
 
-    /** eth_getLogs 单次最大区块跨度（BSC 公共节点限制） */
-    private static final int MAX_BLOCK_RANGE = 2000;
+    /**
+     * 每次 eth_getLogs 最大区块跨度
+     * 公共节点一般限制 500~2000，保守取 500
+     */
+    private static final int MAX_BLOCK_RANGE_WEB3J = 500;
+
+    /** BSCScan API 每次最多返回 10000 条，分页 offset 最大 10000 */
+    private static final int BSCSCAN_PAGE_SIZE = 1000;
 
     @Value("${chain.bsc.rpc-url:https://bsc-dataseed1.binance.org/}")
     private String rpcUrl;
+
+    /**
+     * BSCScan API Key（可选）
+     * 配置后自动切换为 BSCScan 数据源，支持任意历史区块
+     * 申请地址：https://bscscan.com/myapikey
+     */
+    @Value("${chain.bsc.bscscan-api-key:}")
+    private String bscscanApiKey;
 
     private Web3j web3j;
 
     @PostConstruct
     public void init() {
         this.web3j = Web3j.build(new HttpService(rpcUrl));
-        log.info("BSC Scanner 初始化完成, RPC: {}", rpcUrl);
+        String source = hasBscscanKey() ? "BSCScan API + Web3j" : "Web3j RPC only";
+        log.info("BSC Scanner 初始化完成 | RPC: {} | 数据源: {}", rpcUrl, source);
+        if (!hasBscscanKey()) {
+            log.warn("未配置 chain.bsc.bscscan-api-key，仅支持近期数据（约 24-48h）。" +
+                     "历史存档查询请配置 BSCScan API Key");
+        }
     }
 
     @Override
-    public String chainId() {
-        return "BSC";
-    }
+    public String chainId() { return "BSC"; }
 
     // ─── 时间 → 区块号 ─────────────────────────────────────────────
 
     @Override
     public long getBlockNumberByTime(LocalDateTime time) throws Exception {
-        // 获取最新区块作为参考点，用平均出块时间倒推
-        EthBlock latestBlock = web3j
+        EthBlock latest = web3j
                 .ethGetBlockByNumber(DefaultBlockParameterName.LATEST, false)
                 .send();
-        BigInteger latestNumber = latestBlock.getBlock().getNumber();
-        long latestTs = latestBlock.getBlock().getTimestamp().longValue();
+        long latestNum = latest.getBlock().getNumber().longValue();
+        long latestTs  = latest.getBlock().getTimestamp().longValue();
+        long targetTs  = time.atZone(ZoneId.of("Asia/Shanghai")).toInstant().getEpochSecond();
 
-        long targetTs = time.atZone(ZoneId.of("Asia/Shanghai"))
-                .toInstant().getEpochSecond();
-
-        long diffSeconds = latestTs - targetTs;
-        long diffBlocks  = diffSeconds / BSC_BLOCK_TIME_SECONDS;
-        long targetBlock = latestNumber.longValue() - diffBlocks;
-
-        log.debug("时间 {} → 估算区块 {} (最新区块 {})", time, targetBlock, latestNumber);
-        return Math.max(targetBlock, 0);
+        long diffBlocks = (latestTs - targetTs) / BSC_BLOCK_TIME_SECONDS;
+        long targetBlock = latestNum - diffBlocks;
+        log.debug("时间 {} → 估算区块 {} (最新区块 {})", time, targetBlock, latestNum);
+        return Math.max(targetBlock, 1);
     }
 
-    // ─── 扫描买入记录 ──────────────────────────────────────────────
+    // ─── 扫描入口 ──────────────────────────────────────────────────
 
     @Override
     public List<TokenBuyer> scanBuyers(String tokenAddress,
@@ -105,32 +119,112 @@ public class BscScanner implements ChainScanner {
                                         long toBlock,
                                         BigDecimal minAmount,
                                         int decimals) throws Exception {
-        log.info("[BSC] 扫描 token={} 区块 [{}, {}] minAmount={} decimals={}",
-                tokenAddress, fromBlock, toBlock, minAmount, decimals);
+        if (hasBscscanKey()) {
+            log.info("[BSC] 使用 BSCScan API 扫描 (支持历史存档)");
+            return scanViaBscscan(tokenAddress, fromBlock, toBlock, minAmount, decimals);
+        } else {
+            log.info("[BSC] 使用 Web3j RPC 扫描 (近期数据)");
+            return scanViaWeb3j(tokenAddress, fromBlock, toBlock, minAmount, decimals);
+        }
+    }
 
-        // minAmount 转换为原始 uint256 阈值
+    // ─── 方式 1：BSCScan API ───────────────────────────────────────
+
+    private List<TokenBuyer> scanViaBscscan(String tokenAddress,
+                                             long fromBlock, long toBlock,
+                                             BigDecimal minAmount, int decimals) throws Exception {
         BigDecimal factor    = BigDecimal.TEN.pow(decimals);
         BigInteger threshold = minAmount.multiply(factor).toBigInteger();
 
         List<TokenBuyer> result = new ArrayList<>();
+        int page = 1;
 
-        // 分批拉取（避免单次超限）
-        for (long start = fromBlock; start <= toBlock; start += MAX_BLOCK_RANGE) {
-            long end = Math.min(start + MAX_BLOCK_RANGE - 1, toBlock);
-            List<TokenBuyer> batch = fetchBatch(tokenAddress, start, end,
-                    threshold, decimals, factor);
-            result.addAll(batch);
-            log.debug("[BSC] 区块 [{},{}] 找到 {} 条", start, end, batch.size());
+        while (true) {
+            String url = String.format(
+                "https://api.bscscan.com/api?module=account&action=tokentx" +
+                "&contractaddress=%s&startblock=%d&endblock=%d" +
+                "&sort=asc&page=%d&offset=%d&apikey=%s",
+                tokenAddress, fromBlock, toBlock, page, BSCSCAN_PAGE_SIZE, bscscanApiKey);
+
+            String resp = httpGet(url);
+            org.json.JSONObject json = new org.json.JSONObject(resp);
+
+            if (!"1".equals(json.optString("status"))) {
+                String msg = json.optString("message", "");
+                if ("No transactions found".equals(msg)) break;
+                log.warn("[BSC][BSCScan] 第{}页异常: {}", page, msg);
+                break;
+            }
+
+            org.json.JSONArray txList = json.getJSONArray("result");
+            log.debug("[BSC][BSCScan] 第{}页 {} 条", page, txList.length());
+
+            boolean hasMore = false;
+            for (int i = 0; i < txList.length(); i++) {
+                org.json.JSONObject tx = txList.getJSONObject(i);
+                BigInteger value = new BigInteger(tx.getString("value"));
+                if (value.compareTo(threshold) < 0) continue;
+
+                String to = tx.getString("to").toLowerCase();
+                String from = tx.getString("from").toLowerCase();
+                if (to.equals(from)) continue;
+                if (to.equals("0x0000000000000000000000000000000000000000")) continue;
+
+                BigDecimal readable = new BigDecimal(value).divide(factor);
+                long ts = Long.parseLong(tx.getString("timeStamp"));
+                LocalDateTime blockTime = LocalDateTime.ofInstant(
+                        Instant.ofEpochSecond(ts), ZoneId.of("Asia/Shanghai"));
+
+                result.add(TokenBuyer.builder()
+                        .chainId("BSC")
+                        .tokenAddress(tokenAddress)
+                        .buyerAddress(to)
+                        .amount(readable)
+                        .txHash(tx.getString("hash"))
+                        .blockNumber(Long.parseLong(tx.getString("blockNumber")))
+                        .blockTime(blockTime)
+                        .build());
+                hasMore = true;
+            }
+
+            if (txList.length() < BSCSCAN_PAGE_SIZE) break;
+            if (!hasMore) break;
+            page++;
+            Thread.sleep(200); // BSCScan 限速
         }
 
-        log.info("[BSC] 扫描完成，共找到 {} 条买入记录", result.size());
+        log.info("[BSC][BSCScan] 共找到 {} 条符合记录", result.size());
         return result;
     }
 
-    private List<TokenBuyer> fetchBatch(String tokenAddress,
-                                         long fromBlock, long toBlock,
-                                         BigInteger threshold,
-                                         int decimals, BigDecimal factor) throws Exception {
+    // ─── 方式 2：Web3j eth_getLogs ─────────────────────────────────
+
+    private List<TokenBuyer> scanViaWeb3j(String tokenAddress,
+                                           long fromBlock, long toBlock,
+                                           BigDecimal minAmount, int decimals) throws Exception {
+        BigDecimal factor    = BigDecimal.TEN.pow(decimals);
+        BigInteger threshold = minAmount.multiply(factor).toBigInteger();
+        List<TokenBuyer> result = new ArrayList<>();
+
+        for (long start = fromBlock; start <= toBlock; start += MAX_BLOCK_RANGE_WEB3J) {
+            long end = Math.min(start + MAX_BLOCK_RANGE_WEB3J - 1, toBlock);
+            try {
+                List<TokenBuyer> batch = fetchBatchViaWeb3j(
+                        tokenAddress, start, end, threshold, decimals, factor);
+                result.addAll(batch);
+                log.debug("[BSC][Web3j] 区块 [{},{}] 找到 {} 条", start, end, batch.size());
+            } catch (Exception e) {
+                log.warn("[BSC][Web3j] 区块 [{},{}] 失败: {}", start, end, e.getMessage());
+            }
+        }
+        log.info("[BSC][Web3j] 共找到 {} 条符合记录", result.size());
+        return result;
+    }
+
+    private List<TokenBuyer> fetchBatchViaWeb3j(String tokenAddress,
+                                                  long fromBlock, long toBlock,
+                                                  BigInteger threshold,
+                                                  int decimals, BigDecimal factor) throws Exception {
         EthFilter filter = new EthFilter(
                 DefaultBlockParameter.valueOf(BigInteger.valueOf(fromBlock)),
                 DefaultBlockParameter.valueOf(BigInteger.valueOf(toBlock)),
@@ -139,84 +233,51 @@ public class BscScanner implements ChainScanner {
 
         EthLog ethLog = web3j.ethGetLogs(filter).send();
         if (ethLog.hasError()) {
-            log.warn("[BSC] getLogs 错误: {}", ethLog.getError().getMessage());
-            return Collections.emptyList();
+            throw new RuntimeException(ethLog.getError().getMessage());
         }
 
         List<TokenBuyer> buyers = new ArrayList<>();
-        for (EthLog.LogResult<?> logResult : ethLog.getLogs()) {
-            EthLog.LogObject log0 = (EthLog.LogObject) logResult.get();
+        for (EthLog.LogResult<?> lr : ethLog.getLogs()) {
+            EthLog.LogObject log0 = (EthLog.LogObject) lr.get();
             try {
-                TokenBuyer buyer = parseTransferLog(log0, tokenAddress,
-                        threshold, decimals, factor);
-                if (buyer != null) {
-                    buyers.add(buyer);
-                }
+                List<String> topics = log0.getTopics();
+                if (topics.size() < 3) continue;
+
+                String from = "0x" + topics.get(1).substring(26);
+                String to   = "0x" + topics.get(2).substring(26);
+                BigInteger value = new BigInteger(log0.getData().substring(2), 16);
+
+                if (value.compareTo(threshold) < 0) continue;
+                if (from.equalsIgnoreCase(to)) continue;
+                if (to.equalsIgnoreCase("0x0000000000000000000000000000000000000000")) continue;
+
+                EthBlock block = web3j.ethGetBlockByNumber(
+                        DefaultBlockParameter.valueOf(log0.getBlockNumber()), false).send();
+                long ts = block.getBlock().getTimestamp().longValue();
+                LocalDateTime blockTime = LocalDateTime.ofInstant(
+                        Instant.ofEpochSecond(ts), ZoneId.of("Asia/Shanghai"));
+
+                buyers.add(TokenBuyer.builder()
+                        .chainId("BSC")
+                        .tokenAddress(tokenAddress.toLowerCase())
+                        .buyerAddress(to.toLowerCase())
+                        .amount(new BigDecimal(value).divide(factor))
+                        .txHash(log0.getTransactionHash())
+                        .blockNumber(log0.getBlockNumber().longValue())
+                        .blockTime(blockTime)
+                        .build());
             } catch (Exception e) {
-                log.warn("[BSC] 解析日志失败 txHash={}: {}", log0.getTransactionHash(), e.getMessage());
+                log.warn("[BSC][Web3j] 解析 log 失败: {}", e.getMessage());
             }
         }
         return buyers;
-    }
-
-    /**
-     * 解析一条 Transfer 日志
-     * 判断为"买入"的条件：
-     *   1. value >= threshold
-     *   2. from 是合约地址（DEX pair），to 是 EOA（普通钱包）
-     *      — 简化处理：只过 value 阈值，DEX 买入判断留给后续扩展
-     */
-    private TokenBuyer parseTransferLog(EthLog.LogObject log0,
-                                         String tokenAddress,
-                                         BigInteger threshold,
-                                         int decimals,
-                                         BigDecimal factor) throws Exception {
-        List<String> topics = log0.getTopics();
-        if (topics.size() < 3) return null;
-
-        // 解析 from / to（topics[1] / topics[2]，32字节补齐，取后20字节）
-        String from = "0x" + topics.get(1).substring(26);
-        String to   = "0x" + topics.get(2).substring(26);
-
-        // 解析 value（data 字段）
-        BigInteger value = new BigInteger(
-                log0.getData().substring(2), 16);
-
-        // 过滤：数量不足
-        if (value.compareTo(threshold) < 0) return null;
-
-        // 过滤：from == to（自转账）或 to 是零地址（铸造/销毁）
-        if (from.equalsIgnoreCase(to)) return null;
-        if (to.equalsIgnoreCase("0x0000000000000000000000000000000000000000")) return null;
-
-        // 获取区块时间
-        EthBlock block = web3j
-                .ethGetBlockByNumber(
-                        DefaultBlockParameter.valueOf(log0.getBlockNumber()), false)
-                .send();
-        long ts = block.getBlock().getTimestamp().longValue();
-        LocalDateTime blockTime = LocalDateTime.ofInstant(
-                Instant.ofEpochSecond(ts), ZoneId.of("Asia/Shanghai"));
-
-        BigDecimal readableAmount = new BigDecimal(value).divide(factor);
-
-        return TokenBuyer.builder()
-                .chainId("BSC")
-                .tokenAddress(tokenAddress.toLowerCase())
-                .buyerAddress(to.toLowerCase())
-                .amount(readableAmount)
-                .txHash(log0.getTransactionHash())
-                .blockNumber(log0.getBlockNumber().longValue())
-                .blockTime(blockTime)
-                .build();
     }
 
     // ─── 代币精度 ──────────────────────────────────────────────────
 
     @Override
     public int getTokenDecimals(String tokenAddress) throws Exception {
-        Function function = new Function(
-                "decimals",
+        Function function = new Function("decimals",
                 Collections.emptyList(),
                 Collections.singletonList(new TypeReference<Uint8>() {}));
         String encoded = FunctionEncoder.encode(function);
@@ -224,16 +285,31 @@ public class BscScanner implements ChainScanner {
         org.web3j.protocol.core.methods.request.Transaction tx =
                 org.web3j.protocol.core.methods.request.Transaction
                         .createEthCallTransaction(null, tokenAddress, encoded);
-
-        String result = web3j.ethCall(tx, DefaultBlockParameterName.LATEST)
-                .send().getValue();
-
+        String result = web3j.ethCall(tx, DefaultBlockParameterName.LATEST).send().getValue();
         if (result == null || result.equals("0x")) return 18;
 
-        List<?> decoded = FunctionReturnDecoder.decode(result,
-                function.getOutputParameters());
-        if (decoded.isEmpty()) return 18;
+        List<?> decoded = FunctionReturnDecoder.decode(result, function.getOutputParameters());
+        return decoded.isEmpty() ? 18 : ((Uint8) decoded.get(0)).getValue().intValue();
+    }
 
-        return ((Uint8) decoded.get(0)).getValue().intValue();
+    // ─── 工具方法 ──────────────────────────────────────────────────
+
+    private boolean hasBscscanKey() {
+        return bscscanApiKey != null && !bscscanApiKey.isBlank();
+    }
+
+    private String httpGet(String url) throws Exception {
+        java.net.HttpURLConnection conn = (java.net.HttpURLConnection)
+                new java.net.URL(url).openConnection();
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(10000);
+        conn.setReadTimeout(30000);
+        try (java.io.InputStream is = conn.getInputStream();
+             java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream()) {
+            byte[] tmp = new byte[4096];
+            int n;
+            while ((n = is.read(tmp)) != -1) buf.write(tmp, 0, n);
+            return buf.toString("UTF-8");
+        }
     }
 }
