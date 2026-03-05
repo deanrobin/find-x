@@ -27,3 +27,6 @@ spring-shell.log
 # Application config with secrets
 application-local.yml
 application-prod.yml
+
+# Environment variables (contains passwords)
+.env
